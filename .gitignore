@@ -1,0 +1,16 @@
+# Build outputs
+*.exe
+*.zip
+*.log
+
+# Local settings / runtime state
+settings.json
+*.tmp
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

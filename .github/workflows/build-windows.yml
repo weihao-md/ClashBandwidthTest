@@ -1,0 +1,39 @@
+name: Build Windows
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: GOOS=windows GOARCH=amd64 go vet ./...
+
+      - name: Build Windows x64
+        run: |
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w -H=windowsgui" \
+            -o ClashBandwidthTest.exe .
+
+      - name: SHA-256
+        run: sha256sum ClashBandwidthTest.exe | tee SHA256SUMS.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClashBandwidthTest-win64
+          path: |
+            ClashBandwidthTest.exe
+            SHA256SUMS.txt
