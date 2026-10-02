@@ -3307,11 +3307,38 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	return r
 }
 
+
+var instanceMutex syscall.Handle
+
+// ensureSingleInstance prevents multiple GUI instances from running.
+// A second launch simply exits; the existing window remains available.
+func ensureSingleInstance() bool {
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	createMutex := kernel32.NewProc("CreateMutexW")
+
+	name, _ := syscall.UTF16PtrFromString("Global\\ClashBandwidthTest_Instance_v1")
+	h, _, _ := createMutex.Call(0, 0, uintptr(unsafe.Pointer(name)))
+	if h == 0 {
+		return false
+	}
+	instanceMutex = syscall.Handle(h)
+
+	err := syscall.GetLastError()
+	if err == syscall.ERROR_ALREADY_EXISTS {
+		return false
+	}
+	return true
+}
+
 func main() {
 	// A Win32 window and its message queue are bound to the OS thread that
 	// created them. Keep the full GUI lifetime on one OS thread.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+
+	if !ensureSingleInstance() {
+		return
+	}
 
 	settings = loadSettings()
 

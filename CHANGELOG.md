@@ -43,3 +43,12 @@
 
 ## v1.0
 - 初始版本：节点读取、延迟测试、下载带宽测速与原节点恢复。
+
+
+## v1.8.2
+
+### Added
+- Single-instance protection to prevent multiple ClashBandwidthTest windows running simultaneously.
+
+### Improved
+- Prevent duplicate Clash controller operations caused by multiple instances.
