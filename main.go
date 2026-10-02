@@ -74,6 +74,7 @@ const (
 	WM_APP_SWITCH  = 0x8007
 	WM_APP_LISTDBL = 0x8008
 	WM_APP_TRAY    = 0x8009
+	WM_APP_WAKE    = 0x8010
 
 	WS_OVERLAPPED     = 0x00000000
 	WS_CAPTION        = 0x00C00000
@@ -401,6 +402,7 @@ var (
 	procRegisterHotKey       = user32.NewProc("RegisterHotKey")
 	procUnregisterHotKey     = user32.NewProc("UnregisterHotKey")
 	procSetForegroundWindow  = user32.NewProc("SetForegroundWindow")
+	procFindWindowW          = user32.NewProc("FindWindowW")
 	procGetForegroundWindow  = user32.NewProc("GetForegroundWindow")
 	procGetClientRect        = user32.NewProc("GetClientRect")
 	procIsWindowVisible      = user32.NewProc("IsWindowVisible")
@@ -2852,6 +2854,11 @@ func regionWndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uint
 			procDestroyWindow.Call(uintptr(hwnd))
 			return 0
 		}
+	case WM_APP_WAKE:
+		procShowWindow.Call(uintptr(hwndMain), SW_RESTORE)
+		procShowWindow.Call(uintptr(hwndMain), SW_SHOW)
+		procSetForegroundWindow.Call(uintptr(hwndMain))
+		return 0
 	case WM_CLOSE:
 		procDestroyWindow.Call(uintptr(hwnd))
 		return 0
@@ -2976,6 +2983,11 @@ func settingsWndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) ui
 				procEnableWindow.Call(uintptr(hSetHotkeyEdit), 0)
 			}
 		}
+	case WM_APP_WAKE:
+		procShowWindow.Call(uintptr(hwndMain), SW_RESTORE)
+		procShowWindow.Call(uintptr(hwndMain), SW_SHOW)
+		procSetForegroundWindow.Call(uintptr(hwndMain))
+		return 0
 	case WM_CLOSE:
 		procDestroyWindow.Call(uintptr(hwnd))
 		return 0
@@ -3287,6 +3299,11 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 			}
 		}
 		return 0
+	case WM_APP_WAKE:
+		procShowWindow.Call(uintptr(hwndMain), SW_RESTORE)
+		procShowWindow.Call(uintptr(hwndMain), SW_SHOW)
+		procSetForegroundWindow.Call(uintptr(hwndMain))
+		return 0
 	case WM_CLOSE:
 		if settings.CloseToTray {
 			procShowWindow.Call(uintptr(hwndMain), SW_HIDE)
@@ -3325,6 +3342,10 @@ func ensureSingleInstance() bool {
 
 	err := syscall.GetLastError()
 	if err == syscall.ERROR_ALREADY_EXISTS {
+		className, _ := syscall.UTF16PtrFromString("ClashBandwidthTestWnd")
+		if hwnd, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(className)), 0); hwnd != 0 {
+			procPostMessageW.Call(hwnd, WM_APP_WAKE, 0, 0)
+		}
 		return false
 	}
 	return true
