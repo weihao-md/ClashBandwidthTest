@@ -101,6 +101,9 @@ const (
 
 	WM_DESTROY       = 0x0002
 	WM_SIZE          = 0x0005
+	WM_ENTERSIZEMOVE  = 0x0231
+	WM_EXITSIZEMOVE   = 0x0232
+	WM_SETREDRAW      = 0x000B
 	WM_COMMAND       = 0x0111
 	WM_CLOSE         = 0x0010
 	WM_SETFONT       = 0x0030
@@ -3089,10 +3092,25 @@ func listWndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintpt
 	return r
 }
 
+var resizingWindow bool
+
 func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
-	case WM_SIZE:
+	case WM_ENTERSIZEMOVE:
+		resizingWindow = true
+		send(hList, WM_SETREDRAW, 0, 0)
+		return 0
+	case WM_EXITSIZEMOVE:
+		resizingWindow = false
+		send(hList, WM_SETREDRAW, 1, 0)
 		resizeListColumns()
+		refreshList()
+		return 0
+	case WM_SIZE:
+		if !resizingWindow {
+			resizeListColumns()
+			refreshList()
+		}
 		return 0
 	case WM_COMMAND:
 		id := int32(loword(wParam))

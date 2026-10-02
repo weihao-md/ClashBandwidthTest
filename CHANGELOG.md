@@ -1,3 +1,10 @@
+## v1.8.4
+
+### Fixed
+- Improved ListView refresh behavior during window resizing.
+- Prevented table content disappearing after resize/maximize operations.
+- Improved stability when changing window size on multi-monitor setups.
+
 # Changelog
 
 ## v1.8
