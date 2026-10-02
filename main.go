@@ -99,6 +99,7 @@ const (
 	SW_RESTORE            = 9
 
 	WM_DESTROY       = 0x0002
+	WM_SIZE          = 0x0005
 	WM_COMMAND       = 0x0111
 	WM_CLOSE         = 0x0010
 	WM_SETFONT       = 0x0030
@@ -123,6 +124,7 @@ const (
 	LVM_INSERTITEMW              = LVM_FIRST + 77
 	LVM_SETITEMTEXTW             = LVM_FIRST + 116
 	LVM_INSERTCOLUMNW            = LVM_FIRST + 97
+	LVM_SETCOLUMNWIDTH           = LVM_FIRST + 30
 	LVM_DELETEALLITEMS           = LVM_FIRST + 9
 	LVM_SETEXTENDEDLISTVIEWSTYLE = LVM_FIRST + 54
 	LVM_GETNEXTITEM              = LVM_FIRST + 12
@@ -200,6 +202,7 @@ type MSG struct {
 }
 
 type POINT struct{ X, Y int32 }
+type RECT struct { Left, Top, Right, Bottom int32 }
 
 type INITCOMMONCONTROLSEX struct{ DwSize, DwICC uint32 }
 
@@ -399,6 +402,7 @@ var (
 	procUnregisterHotKey     = user32.NewProc("UnregisterHotKey")
 	procSetForegroundWindow  = user32.NewProc("SetForegroundWindow")
 	procGetForegroundWindow  = user32.NewProc("GetForegroundWindow")
+	procGetClientRect        = user32.NewProc("GetClientRect")
 	procIsWindowVisible      = user32.NewProc("IsWindowVisible")
 	procCreatePopupMenu      = user32.NewProc("CreatePopupMenu")
 	procAppendMenuW          = user32.NewProc("AppendMenuW")
@@ -770,6 +774,28 @@ func addColumn(index int32, name string, width int32) {
 	t, _ := syscall.UTF16PtrFromString(name)
 	col := LVCOLUMN{Mask: LVCF_FMT | LVCF_WIDTH | LVCF_TEXT, Fmt: LVCFMT_LEFT, Cx: width, PszText: t}
 	send(hList, LVM_INSERTCOLUMNW, uintptr(index), uintptr(unsafe.Pointer(&col)))
+}
+
+
+func resizeListColumns() {
+	if hList == 0 {
+		return
+	}
+	var rc RECT
+	r, _, _ := procGetClientRect.Call(uintptr(hList), uintptr(unsafe.Pointer(&rc)))
+	if r == 0 {
+		return
+	}
+	w := rc.Right - rc.Left
+	if w < 400 {
+		return
+	}
+	// Keep all columns visible when moving between monitors with different DPI.
+	ratios := []int32{22, 8, 8, 8, 9, 11, 10, 10, 8, 6}
+	for i, p := range ratios {
+		cw := w * p / 100
+		send(hList, LVM_SETCOLUMNWIDTH, uintptr(i), uintptr(cw))
+	}
 }
 
 func refreshList() {
@@ -3053,6 +3079,9 @@ func listWndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintpt
 
 func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
+	case WM_SIZE:
+		resizeListColumns()
+		return 0
 	case WM_COMMAND:
 		id := int32(loword(wParam))
 		notify := hiword(wParam)
@@ -3365,6 +3394,7 @@ func main() {
 	addColumn(7, "峰值速度", 88)
 	addColumn(8, "路径验证", 145)
 	addColumn(9, "状态", 88)
+	resizeListColumns()
 
 	// Advanced/manual fallback. Hidden unless auto-detection fails or the user opens it.
 	hConnLabel = createControl(0, "STATIC", "Controller", WS_CHILD|WS_VISIBLE, 18, 580, 75, 22, 0)
