@@ -26,7 +26,8 @@ import (
 )
 
 const (
-	appTitle = "ClashBandwidthTest"
+	appTitle   = "ClashBandwidthTest"
+	appVersion = "2.0.1"
 
 	IDC_CONTROLLER  = 1001
 	IDC_SECRET      = 1002
@@ -94,19 +95,19 @@ const (
 	LVS_SHOWSELALWAYS = 0x0008
 	WS_EX_CLIENTEDGE  = 0x00000200
 
-	CW_USEDEFAULT uintptr = 0x80000000
-	SW_HIDE               = 0
-	SW_SHOW               = 5
-	SW_RESTORE            = 9
-	SWP_NOZORDER          = 0x0004
-	SWP_NOACTIVATE        = 0x0010
+	CW_USEDEFAULT  uintptr = 0x80000000
+	SW_HIDE                = 0
+	SW_SHOW                = 5
+	SW_RESTORE             = 9
+	SWP_NOZORDER           = 0x0004
+	SWP_NOACTIVATE         = 0x0010
 
 	WM_DESTROY       = 0x0002
 	WM_SIZE          = 0x0005
 	WM_DPICHANGED    = 0x02E0
-	WM_ENTERSIZEMOVE  = 0x0231
-	WM_EXITSIZEMOVE   = 0x0232
-	WM_SETREDRAW      = 0x000B
+	WM_ENTERSIZEMOVE = 0x0231
+	WM_EXITSIZEMOVE  = 0x0232
+	WM_SETREDRAW     = 0x000B
 	WM_COMMAND       = 0x0111
 	WM_CLOSE         = 0x0010
 	WM_SETFONT       = 0x0030
@@ -209,7 +210,7 @@ type MSG struct {
 }
 
 type POINT struct{ X, Y int32 }
-type RECT struct { Left, Top, Right, Bottom int32 }
+type RECT struct{ Left, Top, Right, Bottom int32 }
 
 type INITCOMMONCONTROLSEX struct{ DwSize, DwICC uint32 }
 
@@ -389,8 +390,8 @@ var (
 	procDefWindowProcW       = user32.NewProc("DefWindowProcW")
 	procShowWindow           = user32.NewProc("ShowWindow")
 	procUpdateWindow         = user32.NewProc("UpdateWindow")
-	procSetWindowPos          = user32.NewProc("SetWindowPos")
-	procRtlMoveMemory          = kernel32.NewProc("RtlMoveMemory")
+	procSetWindowPos         = user32.NewProc("SetWindowPos")
+	procRtlMoveMemory        = kernel32.NewProc("RtlMoveMemory")
 	procGetMessageW          = user32.NewProc("GetMessageW")
 	procTranslateMessage     = user32.NewProc("TranslateMessage")
 	procDispatchMessageW     = user32.NewProc("DispatchMessageW")
@@ -641,7 +642,7 @@ func trayData() NOTIFYICONDATA {
 	nid.UFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
 	nid.UCallbackMessage = WM_APP_TRAY
 	nid.HIcon = appIconHandle
-	fillUTF16(nid.SzTip[:], "ClashBandwidthTest 1.8")
+	fillUTF16(nid.SzTip[:], appTitle+" "+appVersion)
 	return nid
 }
 
@@ -786,7 +787,6 @@ func addColumn(index int32, name string, width int32) {
 	send(hList, LVM_INSERTCOLUMNW, uintptr(index), uintptr(unsafe.Pointer(&col)))
 }
 
-
 func resizeListColumns() {
 	if hList == 0 {
 		return
@@ -806,16 +806,6 @@ func resizeListColumns() {
 		cw := w * p / 100
 		send(hList, LVM_SETCOLUMNWIDTH, uintptr(i), uintptr(cw))
 	}
-}
-
-
-// scheduleListRebuild rebuilds the ListView after Windows finishes DPI/layout transitions.
-// The native ListView control can temporarily lose its visual cache during monitor changes.
-func scheduleListRebuild() {
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		refreshList()
-	}()
 }
 
 func refreshList() {
@@ -3107,51 +3097,13 @@ func listWndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintpt
 	return r
 }
 
-var resizingWindow bool
-
-func rectFromDPIParam(p uintptr) [4]int32 {
-	var rect [4]int32
-	if p != 0 {
-		procRtlMoveMemory.Call(
-			uintptr(unsafe.Pointer(&rect[0])),
-			p,
-			uintptr(len(rect)*4),
-		)
-	}
-	return rect
-}
-
 func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
-	case WM_ENTERSIZEMOVE:
-		resizingWindow = true
-		send(hList, WM_SETREDRAW, 0, 0)
-		return 0
-	case WM_EXITSIZEMOVE:
-		resizingWindow = false
-		send(hList, WM_SETREDRAW, 1, 0)
-		resizeListColumns()
-		scheduleListRebuild()
-		return 0
-	case WM_DPICHANGED:
-		// Apply Windows recommended rectangle before rebuilding controls.
-		// The old implementation refreshed ListView while DPI transition was
-		// still in progress, which could leave rows blank after monitor changes.
-		if lParam != 0 {
-			r := rectFromDPIParam(lParam)
-			procSetWindowPos.Call(uintptr(hwnd), 0,
-				uintptr(r[0]), uintptr(r[1]),
-				uintptr(r[2]-r[0]), uintptr(r[3]-r[1]),
-				SWP_NOZORDER|SWP_NOACTIVATE)
-		}
-		resizeListColumns()
-		scheduleListRebuild()
-		return 0
 	case WM_SIZE:
-		if !resizingWindow {
-			resizeListColumns()
-			scheduleListRebuild()
-		}
+		// Stability-first: do not disable ListView redraw while a window is
+		// being moved. WM_SETREDRAW(FALSE) can leave the report body blank
+		// while its header still paints after cross-monitor transitions.
+		resizeListColumns()
 		return 0
 	case WM_COMMAND:
 		id := int32(loword(wParam))
@@ -3383,31 +3335,42 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	return r
 }
 
-
 var instanceMutex syscall.Handle
 
-// ensureSingleInstance prevents multiple GUI instances from running.
-// A second launch simply exits; the existing window remains available.
+// ensureSingleInstance keeps exactly one process per interactive Windows session.
+// A second launch wakes the existing window (including from the tray) and exits.
 func ensureSingleInstance() bool {
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
 	createMutex := kernel32.NewProc("CreateMutexW")
-
-	name, _ := syscall.UTF16PtrFromString("Global\\ClashBandwidthTest_Instance_v1")
-	h, _, _ := createMutex.Call(0, 0, uintptr(unsafe.Pointer(name)))
+	closeHandle := kernel32.NewProc("CloseHandle")
+	name, _ := syscall.UTF16PtrFromString("Local\\ClashBandwidthTest.Singleton.2A93D1E8-74C9-4C66-A8D1-5A43C493CB31")
+	h, _, callErr := createMutex.Call(0, 0, uintptr(unsafe.Pointer(name)))
 	if h == 0 {
 		return false
 	}
-	instanceMutex = syscall.Handle(h)
 
-	err := syscall.GetLastError()
-	if err == syscall.ERROR_ALREADY_EXISTS {
-		className, _ := syscall.UTF16PtrFromString("ClashBandwidthTestWnd")
-		if hwnd, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(className)), 0); hwnd != 0 {
-			procPostMessageW.Call(hwnd, WM_APP_WAKE, 0, 0)
-		}
-		return false
+	alreadyExists := false
+	if errno, ok := callErr.(syscall.Errno); ok && errno == syscall.ERROR_ALREADY_EXISTS {
+		alreadyExists = true
 	}
-	return true
+	if !alreadyExists {
+		instanceMutex = syscall.Handle(h)
+		return true
+	}
+
+	// This process does not own the singleton lifetime; close its duplicate
+	// mutex handle and wake the first process. A short retry loop covers the
+	// startup race where the first process owns the mutex but has not yet
+	// created its main window.
+	closeHandle.Call(h)
+	className, _ := syscall.UTF16PtrFromString("ClashBandwidthTestWnd")
+	for i := 0; i < 40; i++ {
+		if existing, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(className)), 0); existing != 0 {
+			procPostMessageW.Call(existing, WM_APP_WAKE, 0, 0)
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
 }
 
 func main() {
@@ -3440,7 +3403,7 @@ func main() {
 	if r, _, _ := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc))); r == 0 {
 		return
 	}
-	r, _, _ := procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(u16(appTitle+" 1.8"))),
+	r, _, _ := procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(u16(appTitle+" "+appVersion))),
 		WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
 		CW_USEDEFAULT, CW_USEDEFAULT, 1060, 740, 0, 0, uintptr(hInst), 0)
 	hwndMain = syscall.Handle(r)
@@ -3512,7 +3475,7 @@ func main() {
 	hConnect = createControl(0, "BUTTON", "手动连接", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 565, 576, 92, 27, IDC_CONNECT)
 	hRedetect = createControl(0, "BUTTON", "重新检测", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 668, 576, 92, 27, IDC_REDETECT)
 
-	hStatus = createControl(0, "STATIC", "v1.8：支持系统托盘与全局快捷键。双击节点可直接切换；选中一行可“重测选中”。测速不会修改 Windows 系统代理、TUN、DNS 或路由设置。", WS_CHILD|WS_VISIBLE, 18, 650, 1008, 42, IDC_STATUS)
+	hStatus = createControl(0, "STATIC", "v"+appVersion+"：支持系统托盘、全局快捷键、单实例运行。双击节点可直接切换；选中一行可“重测选中”。", WS_CHILD|WS_VISIBLE, 18, 650, 1008, 42, IDC_STATUS)
 	setAdvancedVisible(false)
 	updateScopeControls()
 

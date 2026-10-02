@@ -1,3 +1,15 @@
+## v2.0.1
+
+### Fixed
+- Reworked single-instance detection using a session-local named mutex and reliable CreateMutexW error handling.
+- Launching the EXE again now wakes the existing window instead of creating another process.
+- Removed the WM_SETREDRAW/DPI rebuild workaround that could leave the ListView body blank.
+- Switched to stability-first System DPI awareness so Windows scales the complete UI atomically between monitors.
+- Centralized the visible application version; window title and tray tooltip now show 2.0.1.
+
+### Note
+- System DPI awareness favors stability across mixed-DPI displays. On a secondary monitor with a different scale factor, Windows may bitmap-scale the app slightly, which can look a little softer than Per-Monitor V2.
+
 ## v1.9.1a
 
 ### Fixed

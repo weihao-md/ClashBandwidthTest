@@ -17,6 +17,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Vet
         run: GOOS=windows GOARCH=amd64 go vet ./...
