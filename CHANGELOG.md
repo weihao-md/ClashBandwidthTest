@@ -1,3 +1,8 @@
+## v1.9.1a
+
+### Fixed
+- Fixed Go unsafe.Pointer build failure in WM_DPICHANGED handling.
+
 ## v1.9.1
 
 ### Fixed

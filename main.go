@@ -3098,6 +3098,11 @@ func listWndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintpt
 
 var resizingWindow bool
 
+//go:nocheckptr
+func rectFromDPIParam(p uintptr) *[4]int32 {
+	return (*[4]int32)(unsafe.Pointer(p))
+}
+
 func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case WM_ENTERSIZEMOVE:
@@ -3115,7 +3120,7 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		// The old implementation refreshed ListView while DPI transition was
 		// still in progress, which could leave rows blank after monitor changes.
 		if lParam != 0 {
-			r := (*[4]int32)(unsafe.Pointer(lParam))
+			r := rectFromDPIParam(lParam)
 			procSetWindowPos.Call(uintptr(hwnd), 0,
 				uintptr(r[0]), uintptr(r[1]),
 				uintptr(r[2]-r[0]), uintptr(r[3]-r[1]),
