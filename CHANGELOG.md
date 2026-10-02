@@ -1,3 +1,9 @@
+## v1.9.1
+
+### Fixed
+- Properly apply Windows WM_DPICHANGED suggested window bounds before refreshing the UI.
+- Improved ListView stability when moving between monitors with different DPI scaling.
+
 ## v1.9.0
 
 ### Fixed

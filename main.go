@@ -98,6 +98,8 @@ const (
 	SW_HIDE               = 0
 	SW_SHOW               = 5
 	SW_RESTORE            = 9
+	SWP_NOZORDER          = 0x0004
+	SWP_NOACTIVATE        = 0x0010
 
 	WM_DESTROY       = 0x0002
 	WM_SIZE          = 0x0005
@@ -387,6 +389,7 @@ var (
 	procDefWindowProcW       = user32.NewProc("DefWindowProcW")
 	procShowWindow           = user32.NewProc("ShowWindow")
 	procUpdateWindow         = user32.NewProc("UpdateWindow")
+	procSetWindowPos          = user32.NewProc("SetWindowPos")
 	procGetMessageW          = user32.NewProc("GetMessageW")
 	procTranslateMessage     = user32.NewProc("TranslateMessage")
 	procDispatchMessageW     = user32.NewProc("DispatchMessageW")
@@ -3108,8 +3111,16 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		refreshList()
 		return 0
 	case WM_DPICHANGED:
-		// Windows may recreate layout when moving between monitors with
-		// different DPI scaling. Recalculate columns and rebuild the list.
+		// Apply Windows recommended rectangle before rebuilding controls.
+		// The old implementation refreshed ListView while DPI transition was
+		// still in progress, which could leave rows blank after monitor changes.
+		if lParam != 0 {
+			r := (*[4]int32)(unsafe.Pointer(lParam))
+			procSetWindowPos.Call(uintptr(hwnd), 0,
+				uintptr(r[0]), uintptr(r[1]),
+				uintptr(r[2]-r[0]), uintptr(r[3]-r[1]),
+				SWP_NOZORDER|SWP_NOACTIVATE)
+		}
 		resizeListColumns()
 		refreshList()
 		return 0
