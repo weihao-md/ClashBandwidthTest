@@ -101,6 +101,7 @@ const (
 
 	WM_DESTROY       = 0x0002
 	WM_SIZE          = 0x0005
+	WM_DPICHANGED    = 0x02E0
 	WM_ENTERSIZEMOVE  = 0x0231
 	WM_EXITSIZEMOVE   = 0x0232
 	WM_SETREDRAW      = 0x000B
@@ -3103,6 +3104,12 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	case WM_EXITSIZEMOVE:
 		resizingWindow = false
 		send(hList, WM_SETREDRAW, 1, 0)
+		resizeListColumns()
+		refreshList()
+		return 0
+	case WM_DPICHANGED:
+		// Windows may recreate layout when moving between monitors with
+		// different DPI scaling. Recalculate columns and rebuild the list.
 		resizeListColumns()
 		refreshList()
 		return 0

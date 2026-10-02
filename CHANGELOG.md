@@ -1,3 +1,9 @@
+## v1.9.0
+
+### Fixed
+- Added explicit DPI change handling for multi-monitor Windows setups.
+- Improved ListView rebuild after DPI/layout changes.
+
 ## v1.8.4
 
 ### Fixed
