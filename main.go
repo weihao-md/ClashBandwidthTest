@@ -808,6 +808,16 @@ func resizeListColumns() {
 	}
 }
 
+
+// scheduleListRebuild rebuilds the ListView after Windows finishes DPI/layout transitions.
+// The native ListView control can temporarily lose its visual cache during monitor changes.
+func scheduleListRebuild() {
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		refreshList()
+	}()
+}
+
 func refreshList() {
 	mu.Lock()
 	copyRows := append([]resultRow(nil), rows...)
@@ -3121,7 +3131,7 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		resizingWindow = false
 		send(hList, WM_SETREDRAW, 1, 0)
 		resizeListColumns()
-		refreshList()
+		scheduleListRebuild()
 		return 0
 	case WM_DPICHANGED:
 		// Apply Windows recommended rectangle before rebuilding controls.
@@ -3135,12 +3145,12 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 				SWP_NOZORDER|SWP_NOACTIVATE)
 		}
 		resizeListColumns()
-		refreshList()
+		scheduleListRebuild()
 		return 0
 	case WM_SIZE:
 		if !resizingWindow {
 			resizeListColumns()
-			refreshList()
+			scheduleListRebuild()
 		}
 		return 0
 	case WM_COMMAND:
