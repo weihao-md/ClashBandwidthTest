@@ -390,6 +390,7 @@ var (
 	procShowWindow           = user32.NewProc("ShowWindow")
 	procUpdateWindow         = user32.NewProc("UpdateWindow")
 	procSetWindowPos          = user32.NewProc("SetWindowPos")
+	procRtlMoveMemory          = kernel32.NewProc("RtlMoveMemory")
 	procGetMessageW          = user32.NewProc("GetMessageW")
 	procTranslateMessage     = user32.NewProc("TranslateMessage")
 	procDispatchMessageW     = user32.NewProc("DispatchMessageW")
@@ -3098,9 +3099,16 @@ func listWndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintpt
 
 var resizingWindow bool
 
-//go:nocheckptr
-func rectFromDPIParam(p uintptr) *[4]int32 {
-	return (*[4]int32)(unsafe.Pointer(p))
+func rectFromDPIParam(p uintptr) [4]int32 {
+	var rect [4]int32
+	if p != 0 {
+		procRtlMoveMemory.Call(
+			uintptr(unsafe.Pointer(&rect[0])),
+			p,
+			uintptr(len(rect)*4),
+		)
+	}
+	return rect
 }
 
 func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
