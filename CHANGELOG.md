@@ -1,3 +1,15 @@
+## v2.0.2 (Route verification correction)
+
+### Fixed
+- Match the benchmark connection to Mihomo `/connections` by the exact local TCP source port instead of accepting the first new connection sharing the benchmark hostname.
+- Support Mihomo `sourcePort` values serialized as strings or numbers.
+- Report missing or unobservable connections as unverified, not as proven misrouting.
+- Preserve per-stream isolated transports, disable keep-alive/HTTP2, and refuse redirects to other benchmark hosts.
+
+### Verification
+- Added focused unit tests for source-port parsing and attribution under concurrent connections.
+- Windows runtime + Mihomo integration still requires actual device verification.
+
 ## v2.0.1
 
 ### Fixed

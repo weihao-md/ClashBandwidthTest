@@ -27,7 +27,7 @@ import (
 
 const (
 	appTitle   = "ClashBandwidthTest"
-	appVersion = "2.0.1"
+	appVersion = "2.0.2"
 
 	IDC_CONTROLLER  = 1001
 	IDC_SECRET      = 1002
@@ -291,21 +291,6 @@ type proxiesResponse struct {
 type configResponse struct {
 	MixedPort int `json:"mixed-port"`
 	Port      int `json:"port"`
-}
-
-// connectionSnapshot mirrors the subset of Mihomo /connections used to verify
-// that the speed-test request really traverses the node selected in the group.
-type connectionSnapshot struct {
-	Connections []struct {
-		ID       string   `json:"id"`
-		Download int64    `json:"download"`
-		Chains   []string `json:"chains"`
-		Rule     string   `json:"rule"`
-		Metadata struct {
-			Host          string `json:"host"`
-			DestinationIP string `json:"destinationIP"`
-		} `json:"metadata"`
-	} `json:"connections"`
 }
 
 type resultRow struct {
@@ -1779,20 +1764,9 @@ func getConnections(ctx context.Context, ep clashEndpoint) (connectionSnapshot, 
 	return snap, nil
 }
 
-func existingHostConnectionIDs(ctx context.Context, ep clashEndpoint, host string) map[string]bool {
-	out := map[string]bool{}
-	snap, err := getConnections(ctx, ep)
-	if err != nil {
-		return out
-	}
-	for _, c := range snap.Connections {
-		if strings.EqualFold(strings.TrimSuffix(c.Metadata.Host, "."), host) {
-			out[c.ID] = true
-		}
-	}
-	return out
-}
-
+// Route checks are tied to the local TCP source port of the exact request we
+// opened to Mihomo's HTTP proxy, not to whichever connection shares the host.
+// A missing connection is unknown, never proof of misrouting.
 func chainContains(chains []string, node string) bool {
 	for _, c := range chains {
 		if c == node {
@@ -1802,37 +1776,34 @@ func chainContains(chains []string, node string) bool {
 	return false
 }
 
-func verifyNewHostConnection(ctx context.Context, ep clashEndpoint, host, node string, before map[string]bool) (found bool, ok bool, desc string) {
-	for attempt := 0; attempt < 8; attempt++ {
+func verifyProxyConnection(ctx context.Context, ep clashEndpoint, host, node string, localPort int) (found bool, ok bool, desc string) {
+	if localPort <= 0 {
+		return false, false, "? 无法获取连接端口"
+	}
+	for attempt := 0; attempt < 12; attempt++ {
 		snap, err := getConnections(ctx, ep)
 		if err == nil {
-			for _, c := range snap.Connections {
-				if before[c.ID] {
-					continue
-				}
-				if !strings.EqualFold(strings.TrimSuffix(c.Metadata.Host, "."), host) {
-					continue
+			if c, matched := matchOwnProxyConnection(snap, host, localPort); matched {
+				if chainContains(c.Chains, node) {
+					return true, true, "✓ " + node
 				}
 				chain := strings.Join(c.Chains, " → ")
 				if chain == "" {
 					chain = c.Rule
 				}
-				if chainContains(c.Chains, node) {
-					return true, true, "✓ " + node
-				}
 				if chain == "" {
-					chain = "未知链路"
+					return false, false, "? 连接链路为空"
 				}
 				return true, false, "⚠ " + chain
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return false, false, "? 未验证"
-		case <-time.After(75 * time.Millisecond):
+			return false, false, "? 未验证（已取消）"
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	return false, false, "? 未捕获"
+	return false, false, "? 未捕获本次连接"
 }
 
 type speedResult struct {
@@ -1849,16 +1820,32 @@ type openedStream struct {
 	tr   *http.Transport
 }
 
-func newSpeedClient(proxyPort int) (*http.Client, *http.Transport) {
+func newSpeedClient(proxyPort int) (*http.Client, *http.Transport, *atomic.Int64) {
 	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
+	sourcePort := &atomic.Int64{}
+	dialer := &net.Dialer{Timeout: 8 * time.Second}
 	tr := &http.Transport{
 		Proxy:                 http.ProxyURL(proxyURL),
 		DisableKeepAlives:     true,
 		TLSHandshakeTimeout:   8 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
 		ForceAttemptHTTP2:     false,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			if a, ok := conn.LocalAddr().(*net.TCPAddr); ok {
+				sourcePort.Store(int64(a.Port))
+			}
+			return conn, nil
+		},
 	}
-	return &http.Client{Transport: tr}, tr
+	// Benchmark requests must never silently change host through a redirect.
+	client := &http.Client{Transport: tr, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	return client, tr, sourcePort
 }
 
 func readAtMost(ctx context.Context, body io.Reader, want int64) (int64, error) {
@@ -1913,15 +1900,14 @@ func measureSpeed(ctx context.Context, ep clashEndpoint, node string, proxyPort 
 	// Route probe + warm-up. The warm-up bytes are deliberately excluded from
 	// the reported throughput so TCP/TLS setup and slow-start distort the result less.
 	warmBytes := int64(profile.WarmupMB) * 1000 * 1000
-	before := existingHostConnectionIDs(dctx, ep, host)
-	warmClient, warmTr := newSpeedClient(proxyPort)
+	warmClient, warmTr, warmPort := newSpeedClient(proxyPort)
 	defer warmTr.CloseIdleConnections()
 	warmTarget := "https://" + host + "/__down?bytes=" + strconv.FormatInt(warmBytes, 10)
 	req, err := http.NewRequestWithContext(dctx, http.MethodGet, warmTarget, nil)
 	if err != nil {
 		return out, err
 	}
-	req.Header.Set("User-Agent", "ClashBandwidthTest/1.6")
+	req.Header.Set("User-Agent", "ClashBandwidthTest/"+appVersion)
 	req.Header.Set("Cache-Control", "no-cache")
 	resp, err := warmClient.Do(req)
 	if err != nil {
@@ -1931,7 +1917,7 @@ func measureSpeed(ctx context.Context, ep clashEndpoint, node string, proxyPort 
 		resp.Body.Close()
 		return out, fmt.Errorf("测速源 HTTP %d", resp.StatusCode)
 	}
-	found, routeOK, routeDesc := verifyNewHostConnection(dctx, ep, host, node, before)
+	found, routeOK, routeDesc := verifyProxyConnection(dctx, ep, host, node, int(warmPort.Load()))
 	out.RouteFound, out.RouteOK, out.Route = found, routeOK, routeDesc
 	if found && !routeOK {
 		resp.Body.Close()
@@ -1964,7 +1950,7 @@ func measureSpeed(ctx context.Context, ep clashEndpoint, node string, proxyPort 
 	streamBytes := int64(profile.PerStreamMB) * 1000 * 1000
 	for i := 0; i < profile.Streams; i++ {
 		go func() {
-			client, tr := newSpeedClient(proxyPort)
+			client, tr, _ := newSpeedClient(proxyPort)
 			target := "https://" + host + "/__down?bytes=" + strconv.FormatInt(streamBytes, 10)
 			rq, e := http.NewRequestWithContext(benchCtx, http.MethodGet, target, nil)
 			if e != nil {
@@ -1972,7 +1958,7 @@ func measureSpeed(ctx context.Context, ep clashEndpoint, node string, proxyPort 
 				openCh <- openResult{err: e}
 				return
 			}
-			rq.Header.Set("User-Agent", "ClashBandwidthTest/1.6")
+			rq.Header.Set("User-Agent", "ClashBandwidthTest/"+appVersion)
 			rq.Header.Set("Cache-Control", "no-cache")
 			rp, e := client.Do(rq)
 			if e != nil {
