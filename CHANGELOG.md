@@ -1,3 +1,13 @@
+## v2.0.3
+
+### Fixed
+- Prevent selecting GLOBAL for download benchmarking when Mihomo is running in Rule/Direct mode; this is a routing-mode mismatch, not a node-bandwidth failure.
+- Prefer non-GLOBAL selectors by default and remember the user's last selected group.
+- Detect repeated mismatches during one run and stop early with an actionable explanation.
+- Remember an explicitly approved local HTTP controller and secret across restarts using Windows DPAPI (per-user encrypted file; opt-in checkbox in Advanced settings).
+- Reuse remembered credentials when runtime configuration discovery fails.
+- Preserve bandwidth algorithm, multi-monitor and tray behavior from v2.0.2.
+
 ## v2.0.2 (Route verification correction)
 
 ### Fixed

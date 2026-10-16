@@ -65,3 +65,11 @@ func matchOwnProxyConnection(snap connectionSnapshot, host string, localPort int
 	var empty connectionEntry
 	return empty, false
 }
+
+// groupModeWarning is independent from Windows GUI and unit-tested on Linux.
+func groupModeWarning(mode, group string) string {
+	if strings.EqualFold(strings.TrimSpace(group), "GLOBAL") && !strings.EqualFold(strings.TrimSpace(mode), "global") {
+		return "当前 Mihomo 不是 Global 模式：GLOBAL 策略组不一定承载实际流量。请在 Rule 模式下选择真正生效的规则策略组（如 Sororain），或将 Mihomo 切换到 Global 模式。"
+	}
+	return ""
+}

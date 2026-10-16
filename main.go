@@ -27,7 +27,7 @@ import (
 
 const (
 	appTitle   = "ClashBandwidthTest"
-	appVersion = "2.0.2"
+	appVersion = "2.0.3"
 
 	IDC_CONTROLLER  = 1001
 	IDC_SECRET      = 1002
@@ -48,6 +48,7 @@ const (
 	IDC_SCOPEDETAIL = 1017
 	IDC_RETEST      = 1018
 	IDC_SETTINGS    = 1019
+	IDC_REMEMBER    = 1020
 
 	IDC_REGION_OK     = 2101
 	IDC_REGION_CANCEL = 2102
@@ -244,6 +245,7 @@ type appSettings struct {
 	StartMinimized bool   `json:"start_minimized"`
 	HotkeyEnabled  bool   `json:"hotkey_enabled"`
 	Hotkey         string `json:"hotkey"`
+	LastGroup      string `json:"last_group,omitempty"`
 }
 
 type LVCOLUMN struct {
@@ -289,8 +291,9 @@ type proxiesResponse struct {
 }
 
 type configResponse struct {
-	MixedPort int `json:"mixed-port"`
-	Port      int `json:"port"`
+	MixedPort int    `json:"mixed-port"`
+	Port      int    `json:"port"`
+	Mode      string `json:"mode"`
 }
 
 type resultRow struct {
@@ -415,7 +418,7 @@ var (
 	hwndMain                                                                                                  syscall.Handle
 	hController, hSecret, hConnect, hGroup, hSize, hScope, hPerRegion, hStart, hRetest, hStop, hList, hStatus syscall.Handle
 	hAdvanced, hSettings, hRedetect, hConnLabel, hSecretLabel, hDetected, hEstimate                           syscall.Handle
-	hPerRegionLabel, hRegionSelect, hNameFilter, hScopeDetail                                                 syscall.Handle
+	hPerRegionLabel, hRegionSelect, hNameFilter, hScopeDetail, hRemember                                      syscall.Handle
 	hwndRegionPicker, hwndSettings                                                                            syscall.Handle
 	hSetCloseTray, hSetStartTray, hSetHotkey, hSetHotkeyEdit                                                  syscall.Handle
 	guiFont                                                                                                   syscall.Handle
@@ -444,6 +447,7 @@ var (
 	switchTarget       string
 	switchGroupName    string
 	switchSucceeded    bool
+	connectionSaveErr  string
 	settings           appSettings
 	hotkeyRegistered   bool
 	appIconHandle      syscall.Handle
@@ -496,6 +500,7 @@ func loadSettings() appSettings {
 	if strings.TrimSpace(saved.Hotkey) != "" {
 		st.Hotkey = saved.Hotkey
 	}
+	st.LastGroup = saved.LastGroup
 	return st
 }
 
@@ -847,8 +852,13 @@ func populateGroups() {
 				score += 10
 			}
 		}
-		if strings.Contains(ln, "global") {
-			score += 3
+		if strings.EqualFold(n, "GLOBAL") {
+			// GLOBAL is not the routing selector in Rule mode; never choose it
+			// automatically ahead of user-defined selectors.
+			score -= 100
+		}
+		if n == settings.LastGroup && !strings.EqualFold(n, "GLOBAL") {
+			score += 1000
 		}
 		if score > bestScore {
 			bestScore, best = score, i
@@ -857,6 +867,15 @@ func populateGroups() {
 	if len(names) > 0 {
 		send(hGroup, CB_SETCURSEL, uintptr(best), 0)
 	}
+}
+
+func rememberSelectedGroup() {
+	name := selectedGroup()
+	if name == "" || settings.LastGroup == name {
+		return
+	}
+	settings.LastGroup = name
+	_ = saveSettings(settings) // UI preference only, never a credential
 }
 
 func selectedGroup() string {
@@ -1354,7 +1373,7 @@ func showWindow(h syscall.Handle, show bool) {
 
 func setAdvancedVisible(v bool) {
 	advancedVisible = v
-	for _, h := range []syscall.Handle{hConnLabel, hController, hSecretLabel, hSecret, hConnect, hRedetect} {
+	for _, h := range []syscall.Handle{hConnLabel, hController, hSecretLabel, hSecret, hConnect, hRedetect, hRemember} {
 		showWindow(h, v)
 	}
 	if v {
@@ -1443,6 +1462,7 @@ func candidateConfigPaths() []string {
 		"Clash Verge Rev",
 	} {
 		add(filepath.Join(appData, d, "config.yaml"))
+		add(filepath.Join(appData, d, "runtime.yaml"))
 	}
 	entries, _ := os.ReadDir(appData)
 	for _, e := range entries {
@@ -1583,6 +1603,18 @@ func autoDetectEndpoint() (clashEndpoint, int, string, error) {
 			problems = append(problems, "HTTP Controller: "+e.Error())
 		}
 	}
+	// User-approved, DPAPI-encrypted manual connection is the reliable fallback
+	// when a portable Clash installation uses an unexpected config directory.
+	if ep, err := loadRememberedEndpoint(); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, _, e := endpointRequest(ctx, ep, http.MethodGet, "/proxies", nil)
+		cancel()
+		if e == nil {
+			ep.Mode = "已记住的 HTTP Controller"
+			return ep, 0, "", nil
+		}
+		problems = append(problems, "已记住的控制器连接失败："+e.Error())
+	}
 	// Last-resort local-only probe for users who already enabled the common controller port.
 	for _, base := range []string{"http://127.0.0.1:9090", "http://127.0.0.1:9097"} {
 		ep := clashEndpoint{Base: base, Mode: "HTTP Controller"}
@@ -1653,6 +1685,7 @@ func loadClash(ep clashEndpoint) (map[string]proxyInfo, []string, error) {
 func connectAsync() {
 	base := strings.TrimSpace(getText(hController))
 	secret := strings.TrimSpace(getText(hSecret))
+	remember := send(hRemember, BM_GETCHECK, 0, 0) == BST_CHECKED
 	if base == "" {
 		base = "http://127.0.0.1:9090"
 		setText(hController, base)
@@ -1672,6 +1705,21 @@ func connectAsync() {
 			detectedConfigPath = ""
 		}
 		mu.Unlock()
+		if err == nil {
+			var saveErr error
+			if remember {
+				saveErr = saveRememberedEndpoint(ep)
+			} else {
+				saveErr = clearRememberedEndpoint()
+			}
+			mu.Lock()
+			if saveErr != nil {
+				connectionSaveErr = saveErr.Error()
+			} else {
+				connectionSaveErr = ""
+			}
+			mu.Unlock()
+		}
 		procPostMessageW.Call(uintptr(hwndMain), WM_APP_GROUPS, 0, 0)
 	}()
 }
@@ -1735,6 +1783,28 @@ func getProxyPort(ctx context.Context, ep clashEndpoint, fallback int) (int, err
 		return fallback, nil
 	}
 	return 0, fmt.Errorf("Clash 未启用 mixed-port 或 HTTP port")
+}
+
+// Reject GLOBAL in Rule mode: changing the GLOBAL selector does not route
+// traffic through it while rules still choose an independent selector.
+func validateGroupForMode(ep clashEndpoint, group string) error {
+	if !strings.EqualFold(group, "GLOBAL") {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	b, _, err := endpointRequest(ctx, ep, http.MethodGet, "/configs", nil)
+	if err != nil {
+		return fmt.Errorf("无法确认 Mihomo 运行模式，暂不对 GLOBAL 测速：%w。请先检查当前模式。", err)
+	}
+	var cfg configResponse
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return err
+	}
+	if msg := groupModeWarning(cfg.Mode, group); msg != "" {
+		return fmt.Errorf("%s", msg)
+	}
+	return nil
 }
 
 func measureLatency(ctx context.Context, ep clashEndpoint, node string) int {
@@ -2391,6 +2461,10 @@ func startSelectedRetest() {
 		msgBox(appTitle, "请选择一个策略组。", MB_OK|MB_ICONWARNING)
 		return
 	}
+	if err := validateGroupForMode(ep, group); err != nil {
+		msgBox(appTitle, err.Error(), MB_OK|MB_ICONWARNING)
+		return
+	}
 	profile := selectedProfile()
 
 	mu.Lock()
@@ -2537,6 +2611,10 @@ func startTest() {
 	group := selectedGroup()
 	if group == "" {
 		msgBox(appTitle, "请选择一个策略组。", MB_OK|MB_ICONWARNING)
+		return
+	}
+	if err := validateGroupForMode(ep, group); err != nil {
+		msgBox(appTitle, err.Error(), MB_OK|MB_ICONWARNING)
 		return
 	}
 	profile := selectedProfile()
@@ -2713,6 +2791,8 @@ func startTest() {
 		}
 
 		stage2Start := time.Now()
+		mismatchCount := 0
+		mismatchRoute := ""
 		setRunStatus(runID, fmt.Sprintf("第二阶段：开始带宽测速 0/%d；将临时切换“%s”，结束后恢复“%s”。", len(candidates), group, original))
 		for i, node := range candidates {
 			select {
@@ -2751,7 +2831,24 @@ func startTest() {
 						r.Status = "测速失败"
 					}
 				})
+				if sr.RouteFound && !sr.RouteOK {
+					if sr.Route == mismatchRoute {
+						mismatchCount++
+					} else {
+						mismatchRoute, mismatchCount = sr.Route, 1
+					}
+					if mismatchCount >= 2 {
+						mu.Lock()
+						lastError = fmt.Sprintf("连续两次发现同一条非目标路径：%s。已提前停止带宽测试，避免浪费流量。请检查规则模式和实际生效的策略组。", sr.Route)
+						mu.Unlock()
+						outcome = 2
+						break
+					}
+				} else {
+					mismatchCount, mismatchRoute = 0, ""
+				}
 			} else {
+				mismatchCount, mismatchRoute = 0, ""
 				updateRow(idx, func(r *resultRow) {
 					r.Speed = sr.Average
 					r.P90 = sr.P90
@@ -2937,6 +3034,7 @@ func settingsWndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) ui
 				StartMinimized: send(hSetStartTray, BM_GETCHECK, 0, 0) == BST_CHECKED,
 				HotkeyEnabled:  send(hSetHotkey, BM_GETCHECK, 0, 0) == BST_CHECKED,
 				Hotkey:         strings.TrimSpace(getText(hSetHotkeyEdit)),
+				LastGroup:      settings.LastGroup,
 			}
 			if candidate.HotkeyEnabled {
 				_, _, norm, err := parseHotkey(candidate.Hotkey)
@@ -3117,6 +3215,7 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 			}
 		case IDC_GROUP:
 			if notify == CBN_SELCHANGE {
+				rememberSelectedGroup()
 				updateRegionButton()
 				updateEstimate()
 			}
@@ -3154,6 +3253,7 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		errText := lastError
 		n := len(groupNames)
 		ep := activeEndpoint
+		saveErr := connectionSaveErr
 		mu.Unlock()
 		if errText != "" {
 			setText(hStatus, "手动连接失败")
@@ -3170,7 +3270,11 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 			procEnableWindow.Call(uintptr(hGroup), 1)
 			procEnableWindow.Call(uintptr(hStart), 1)
 			setText(hDetected, "● 已连接 · "+ep.Mode)
-			setText(hStatus, fmt.Sprintf("已连接，发现 %d 个 Selector 策略组。", n))
+			if saveErr != "" {
+				setText(hStatus, "连接成功，但保存连接信息失败："+saveErr)
+			} else {
+				setText(hStatus, fmt.Sprintf("已连接，发现 %d 个 Selector 策略组。", n))
+			}
 			maybeOfferRecovery()
 		}
 		return 0
@@ -3460,6 +3564,10 @@ func main() {
 	send(hSecret, EM_SETPASSWORDCHAR, uintptr('*'), 0)
 	hConnect = createControl(0, "BUTTON", "手动连接", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 565, 576, 92, 27, IDC_CONNECT)
 	hRedetect = createControl(0, "BUTTON", "重新检测", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 668, 576, 92, 27, IDC_REDETECT)
+	hRemember = createControl(0, "BUTTON", "记住连接（本机加密）", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 774, 577, 238, 27, IDC_REMEMBER)
+	if _, err := loadRememberedEndpoint(); err == nil {
+		send(hRemember, BM_SETCHECK, BST_CHECKED, 0)
+	}
 
 	hStatus = createControl(0, "STATIC", "v"+appVersion+"：支持系统托盘、全局快捷键、单实例运行。双击节点可直接切换；选中一行可“重测选中”。", WS_CHILD|WS_VISIBLE, 18, 650, 1008, 42, IDC_STATUS)
 	setAdvancedVisible(false)

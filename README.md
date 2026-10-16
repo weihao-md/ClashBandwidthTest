@@ -4,7 +4,7 @@
 
 它解决的核心问题很简单：Clash 自带的延迟测试只能告诉你 `ms`，但无法直观回答“这个节点到底能跑多少 MB/s”。ClashBandwidthTest 会自动连接本机 Mihomo，按地区/名称筛选节点，进行真实下载吞吐测试，并验证测速流量实际经过了被测节点。
 
-> 当前版本：**v2.0.2**  
+> 当前版本：**v2.0.3**  
 > 平台：Windows x64  
 > 语言：Go + Win32 API
 
@@ -98,3 +98,10 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
 ## 致谢
 
 本项目依赖 Mihomo 提供的本地控制 API，并面向 Clash Verge Rev / Mihomo 使用场景。项目与 Clash Verge Rev、Mihomo 官方项目无隶属关系。
+
+## v2.0.3: 连接记忆与 Rule 模式
+
+- 当 Clash 处于 Rule 模式时，不要用 `GLOBAL` 作为带宽测速策略组；应选择实际路由使用的 Selector。工具会在开始测速前检查。
+- 若自动发现失败，可在“高级”中输入本机 Controller 和 Secret，勾选 **记住连接（本机加密）** 再点击“手动连接”。下一次启动自动尝试本机记忆连接。
+- 记忆文件位于 `%LOCALAPPDATA%\ClashBandwidthTest\controller.dpapi`，使用 Windows 当前用户 DPAPI 加密。此加密不能防御以同一 Windows 用户身份运行的恶意程序。取消勾选并成功手动连接，会删除之前保存的记忆文件。
+- 不会上传 Secret，也不会在 `settings.json` 中以明文保存 Secret。

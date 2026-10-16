@@ -55,3 +55,19 @@ func TestRejectNonLocalSource(t *testing.T) {
 		t.Fatal("must not match a remote proxy connection")
 	}
 }
+
+func TestGroupModeWarning(t *testing.T) {
+	for _, tc := range []struct {
+		mode, group string
+		block       bool
+	}{
+		{"rule", "GLOBAL", true}, {"direct", "GLOBAL", true},
+		{"global", "GLOBAL", false}, {"Global", "global", false},
+		{"rule", "Sororain", false}, {"rule", "日本节点", false},
+	} {
+		got := groupModeWarning(tc.mode, tc.group)
+		if (got != "") != tc.block {
+			t.Fatalf("mode=%q group=%q warning=%q", tc.mode, tc.group, got)
+		}
+	}
+}
