@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -27,7 +26,7 @@ import (
 
 const (
 	appTitle   = "ClashBandwidthTest"
-	appVersion = "2.0.3"
+	appVersion = "2.0.9"
 
 	IDC_CONTROLLER  = 1001
 	IDC_SECRET      = 1002
@@ -49,6 +48,8 @@ const (
 	IDC_RETEST      = 1018
 	IDC_SETTINGS    = 1019
 	IDC_REMEMBER    = 1020
+	IDC_SOURCE      = 1021
+	IDC_CUSTOM_URL  = 1022
 
 	IDC_REGION_OK     = 2101
 	IDC_REGION_CANCEL = 2102
@@ -307,6 +308,7 @@ type resultRow struct {
 	P90     float64
 	Route   string
 	Status  string
+	Error   string
 }
 
 type clashEndpoint struct {
@@ -418,7 +420,7 @@ var (
 	hwndMain                                                                                                  syscall.Handle
 	hController, hSecret, hConnect, hGroup, hSize, hScope, hPerRegion, hStart, hRetest, hStop, hList, hStatus syscall.Handle
 	hAdvanced, hSettings, hRedetect, hConnLabel, hSecretLabel, hDetected, hEstimate                           syscall.Handle
-	hPerRegionLabel, hRegionSelect, hNameFilter, hScopeDetail, hRemember                                      syscall.Handle
+	hPerRegionLabel, hRegionSelect, hNameFilter, hScopeDetail, hRemember, hSource, hCustomURL, hCustomLabel   syscall.Handle
 	hwndRegionPicker, hwndSettings                                                                            syscall.Handle
 	hSetCloseTray, hSetStartTray, hSetHotkey, hSetHotkeyEdit                                                  syscall.Handle
 	guiFont                                                                                                   syscall.Handle
@@ -791,11 +793,20 @@ func resizeListColumns() {
 		return
 	}
 	// Keep all columns visible when moving between monitors with different DPI.
-	ratios := []int32{22, 8, 8, 8, 9, 11, 10, 10, 8, 6}
+	ratios := []int32{18, 7, 6, 7, 7, 8, 7, 7, 8, 8, 17}
 	for i, p := range ratios {
 		cw := w * p / 100
 		send(hList, LVM_SETCOLUMNWIDTH, uintptr(i), uintptr(cw))
 	}
+}
+
+func compactError(s string, maxRunes int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if maxRunes > 1 && len(r) > maxRunes {
+		return string(r[:maxRunes-1]) + "…"
+	}
+	return s
 }
 
 func refreshList() {
@@ -804,7 +815,7 @@ func refreshList() {
 	mu.Unlock()
 	send(hList, LVM_DELETEALLITEMS, 0, 0)
 	for i, r := range copyRows {
-		vals := []string{r.Name, r.Region, r.Line, r.Type, formatLatency(r.Latency), formatSpeed(r.Speed), formatSpeed(r.P90), formatSpeed(r.Peak), r.Route, r.Status}
+		vals := []string{r.Name, r.Region, r.Line, r.Type, formatLatency(r.Latency), formatSpeed(r.Speed), formatSpeed(r.P90), formatSpeed(r.Peak), r.Route, r.Status, compactError(r.Error, 120)}
 		t0, _ := syscall.UTF16PtrFromString(vals[0])
 		item := LVITEM{Mask: LVIF_TEXT, IItem: int32(i), ISubItem: 0, PszText: t0}
 		send(hList, LVM_INSERTITEMW, 0, uintptr(unsafe.Pointer(&item)))
@@ -888,26 +899,31 @@ func selectedGroup() string {
 	return ""
 }
 
-type testProfile struct {
-	Name        string
-	WarmupMB    int
-	Streams     int
-	PerStreamMB int
-	Duration    time.Duration
-	Settle      time.Duration
-}
-
-func (p testProfile) MaxMBPerNode() int {
-	return p.WarmupMB + p.Streams*p.PerStreamMB
-}
-
 func selectedProfile() testProfile {
 	idx := int(send(hSize, CB_GETCURSEL, 0, 0))
+	source := "auto"
+	switch int(send(hSource, CB_GETCURSEL, 0, 0)) {
+	case 1:
+		source = "google"
+	case 2:
+		source = "google_msi"
+	case 3:
+		source = "hetzner"
+	case 4:
+		source = "ovh"
+	case 5:
+		source = "cloudflare"
+	case 6:
+		source = "custom"
+	}
+	customURL := strings.TrimSpace(getText(hCustomURL))
 	if idx == 1 {
 		return testProfile{
 			Name:        "标准测速",
-			WarmupMB:    2,
-			Streams:     4,
+			Source:      source,
+			CustomURL:   customURL,
+			WarmupMB:    0,
+			Streams:     2,
 			PerStreamMB: 15,
 			Duration:    5 * time.Second,
 			Settle:      800 * time.Millisecond,
@@ -915,8 +931,10 @@ func selectedProfile() testProfile {
 	}
 	return testProfile{
 		Name:        "快速筛选",
-		WarmupMB:    1,
-		Streams:     2,
+		Source:      source,
+		CustomURL:   customURL,
+		WarmupMB:    0,
+		Streams:     1,
 		PerStreamMB: 6,
 		Duration:    2 * time.Second,
 		Settle:      500 * time.Millisecond,
@@ -1035,13 +1053,6 @@ func selectedNodeNames() []string {
 	}
 	return out
 }
-
-const (
-	scopeSmart = iota
-	scopeRegions
-	scopeFilter
-	scopeAll
-)
 
 func selectedScope() int {
 	idx := int(send(hScope, CB_GETCURSEL, 0, 0))
@@ -1309,8 +1320,8 @@ func updateEstimate() {
 	if scope == scopeFilter {
 		prefix = "名称筛选"
 	}
-	setText(hEstimate, fmt.Sprintf("%s：%d 个 · 每节点预热 %d MB + %d 路并发 · 最多约 %s · 纯测速时间上限约 %s",
-		prefix, len(nodes), profile.WarmupMB, profile.Streams, formatDataAmountMB(total), formatDuration(maxSeconds)))
+	setText(hEstimate, fmt.Sprintf("%s：%d 个 · 每节点延迟后直接测试 · %d 路下载 · 常规约 %s · 纯测速时间上限约 %s",
+		prefix, len(nodes), profile.Streams, formatDataAmountMB(total), formatDuration(maxSeconds)))
 }
 
 func formatDuration(seconds int) string {
@@ -1337,6 +1348,7 @@ func setRunning(v bool) {
 		procEnableWindow.Call(uintptr(hRetest), 0)
 		procEnableWindow.Call(uintptr(hGroup), 0)
 		procEnableWindow.Call(uintptr(hSize), 0)
+		procEnableWindow.Call(uintptr(hSource), 0)
 		procEnableWindow.Call(uintptr(hScope), 0)
 		procEnableWindow.Call(uintptr(hPerRegion), 0)
 		procEnableWindow.Call(uintptr(hRegionSelect), 0)
@@ -1355,6 +1367,7 @@ func setRunning(v bool) {
 		}
 		procEnableWindow.Call(uintptr(hGroup), 1)
 		procEnableWindow.Call(uintptr(hSize), 1)
+		procEnableWindow.Call(uintptr(hSource), 1)
 		procEnableWindow.Call(uintptr(hScope), 1)
 		procEnableWindow.Call(uintptr(hRegionSelect), 1)
 		procEnableWindow.Call(uintptr(hNameFilter), 1)
@@ -1373,7 +1386,7 @@ func showWindow(h syscall.Handle, show bool) {
 
 func setAdvancedVisible(v bool) {
 	advancedVisible = v
-	for _, h := range []syscall.Handle{hConnLabel, hController, hSecretLabel, hSecret, hConnect, hRedetect, hRemember} {
+	for _, h := range []syscall.Handle{hConnLabel, hController, hSecretLabel, hSecret, hConnect, hRedetect, hRemember, hCustomURL, hCustomLabel} {
 		showWindow(h, v)
 	}
 	if v {
@@ -1572,6 +1585,25 @@ func endpointRequest(ctx context.Context, ep clashEndpoint, method, path string,
 
 func autoDetectEndpoint() (clashEndpoint, int, string, error) {
 	var problems []string
+	// Prefer the last user-confirmed controller first. Runtime config files can
+	// contain stale controller values when Clash Verge Rev has restarted or
+	// switched profiles; the remembered endpoint was previously verified by
+	// an explicit successful manual connection.
+	if ep, err := loadRememberedEndpoint(); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, _, e := endpointRequest(ctx, ep, http.MethodGet, "/proxies", nil)
+		cancel()
+		if e == nil {
+			ep.Mode = "已记住的 HTTP Controller"
+			return ep, 0, "", nil
+		}
+		problems = append(problems, "已记住的控制器连接失败："+e.Error())
+	} else if !os.IsNotExist(err) {
+		problems = append(problems, "读取已记住的连接失败："+err.Error())
+	}
+
+	// Fall back to Clash Verge Rev runtime configuration when the remembered
+	// endpoint is absent or no longer valid.
 	for _, path := range candidateConfigPaths() {
 		if _, err := os.Stat(path); err != nil {
 			continue
@@ -1581,7 +1613,6 @@ func autoDetectEndpoint() (clashEndpoint, int, string, error) {
 			problems = append(problems, filepath.Base(filepath.Dir(path))+": "+err.Error())
 			continue
 		}
-		// Prefer the private Windows named pipe used by Clash Verge Rev itself.
 		if cfg.Pipe != "" {
 			ep := clashEndpoint{Pipe: cfg.Pipe, Secret: cfg.Secret, Mode: "Windows Named Pipe"}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1603,19 +1634,8 @@ func autoDetectEndpoint() (clashEndpoint, int, string, error) {
 			problems = append(problems, "HTTP Controller: "+e.Error())
 		}
 	}
-	// User-approved, DPAPI-encrypted manual connection is the reliable fallback
-	// when a portable Clash installation uses an unexpected config directory.
-	if ep, err := loadRememberedEndpoint(); err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_, _, e := endpointRequest(ctx, ep, http.MethodGet, "/proxies", nil)
-		cancel()
-		if e == nil {
-			ep.Mode = "已记住的 HTTP Controller"
-			return ep, 0, "", nil
-		}
-		problems = append(problems, "已记住的控制器连接失败："+e.Error())
-	}
-	// Last-resort local-only probe for users who already enabled the common controller port.
+	// Last-resort local-only probe for users who already enabled a common
+	// controller port without authentication.
 	for _, base := range []string{"http://127.0.0.1:9090", "http://127.0.0.1:9097"} {
 		ep := clashEndpoint{Base: base, Mode: "HTTP Controller"}
 		ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
@@ -1628,7 +1648,7 @@ func autoDetectEndpoint() (clashEndpoint, int, string, error) {
 	if len(problems) > 0 {
 		return clashEndpoint{}, 0, "", fmt.Errorf("自动检测失败：%s", strings.Join(problems, "；"))
 	}
-	return clashEndpoint{}, 0, "", fmt.Errorf("自动检测失败：未找到 Clash Verge Rev 的运行配置")
+	return clashEndpoint{}, 0, "", fmt.Errorf("自动检测失败：未找到 Clash Verge Rev 的运行配置，也没有可用的已记住连接")
 }
 
 func controllerRequest(ctx context.Context, method, base, secret, path string, body []byte) ([]byte, int, error) {
@@ -1728,12 +1748,21 @@ func autoDetectAsync() {
 	setText(hDetected, "● 正在自动检测 Clash Verge Rev ...")
 	setText(hStatus, "正在读取 Clash Verge Rev 运行配置并连接 Mihomo ...")
 	procEnableWindow.Call(uintptr(hRedetect), 0)
+	remember := hRemember != 0 && send(hRemember, BM_GETCHECK, 0, 0) == BST_CHECKED
 	go func() {
 		ep, pport, cfgPath, err := autoDetectEndpoint()
 		var p map[string]proxyInfo
 		var g []string
+		var saveErr error
 		if err == nil {
 			p, g, err = loadClash(ep)
+		}
+		if err == nil {
+			if remember && ep.Base != "" && ep.Pipe == "" {
+				saveErr = saveRememberedEndpoint(ep)
+			} else if !remember {
+				saveErr = clearRememberedEndpoint()
+			}
 		}
 		mu.Lock()
 		if err != nil {
@@ -1743,6 +1772,11 @@ func autoDetectAsync() {
 			activeEndpoint = ep
 			detectedProxyPort = pport
 			detectedConfigPath = cfgPath
+			if saveErr != nil {
+				connectionSaveErr = saveErr.Error()
+			} else {
+				connectionSaveErr = ""
+			}
 		}
 		mu.Unlock()
 		procPostMessageW.Call(uintptr(hwndMain), WM_APP_DETECT, 0, 0)
@@ -1876,280 +1910,11 @@ func verifyProxyConnection(ctx context.Context, ep clashEndpoint, host, node str
 	return false, false, "? 未捕获本次连接"
 }
 
-type speedResult struct {
-	Average    float64
-	Peak       float64
-	P90        float64
-	Route      string
-	RouteFound bool
-	RouteOK    bool
-}
-
-type openedStream struct {
-	body io.ReadCloser
-	tr   *http.Transport
-}
-
-func newSpeedClient(proxyPort int) (*http.Client, *http.Transport, *atomic.Int64) {
-	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
-	sourcePort := &atomic.Int64{}
-	dialer := &net.Dialer{Timeout: 8 * time.Second}
-	tr := &http.Transport{
-		Proxy:                 http.ProxyURL(proxyURL),
-		DisableKeepAlives:     true,
-		TLSHandshakeTimeout:   8 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-		ForceAttemptHTTP2:     false,
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			conn, err := dialer.DialContext(ctx, network, address)
-			if err != nil {
-				return nil, err
-			}
-			if a, ok := conn.LocalAddr().(*net.TCPAddr); ok {
-				sourcePort.Store(int64(a.Port))
-			}
-			return conn, nil
-		},
+func measureSpeedWithSource(ctx context.Context, ep clashEndpoint, node string, proxyPort int, profile testProfile, source downloadSource) (speedResult, error) {
+	verify := func(c context.Context, host string, port int) (bool, bool, string) {
+		return verifyProxyConnection(c, ep, host, node, port)
 	}
-	// Benchmark requests must never silently change host through a redirect.
-	client := &http.Client{Transport: tr, CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
-	return client, tr, sourcePort
-}
-
-func readAtMost(ctx context.Context, body io.Reader, want int64) (int64, error) {
-	buf := make([]byte, 128*1024)
-	var total int64
-	for total < want {
-		select {
-		case <-ctx.Done():
-			return total, ctx.Err()
-		default:
-		}
-		next := int64(len(buf))
-		if remain := want - total; remain < next {
-			next = remain
-		}
-		n, err := body.Read(buf[:int(next)])
-		if n > 0 {
-			total += int64(n)
-		}
-		if err != nil {
-			if err == io.EOF {
-				return total, nil
-			}
-			return total, err
-		}
-	}
-	return total, nil
-}
-
-func percentile90(values []float64) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	v := append([]float64(nil), values...)
-	sort.Float64s(v)
-	idx := (9*len(v)+9)/10 - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(v) {
-		idx = len(v) - 1
-	}
-	return v[idx]
-}
-
-func measureSpeed(ctx context.Context, ep clashEndpoint, node string, proxyPort int, profile testProfile) (speedResult, error) {
-	var out speedResult
-	host := "speed.cloudflare.com"
-	dctx, cancel := context.WithTimeout(ctx, profile.Duration+20*time.Second)
-	defer cancel()
-
-	// Route probe + warm-up. The warm-up bytes are deliberately excluded from
-	// the reported throughput so TCP/TLS setup and slow-start distort the result less.
-	warmBytes := int64(profile.WarmupMB) * 1000 * 1000
-	warmClient, warmTr, warmPort := newSpeedClient(proxyPort)
-	defer warmTr.CloseIdleConnections()
-	warmTarget := "https://" + host + "/__down?bytes=" + strconv.FormatInt(warmBytes, 10)
-	req, err := http.NewRequestWithContext(dctx, http.MethodGet, warmTarget, nil)
-	if err != nil {
-		return out, err
-	}
-	req.Header.Set("User-Agent", "ClashBandwidthTest/"+appVersion)
-	req.Header.Set("Cache-Control", "no-cache")
-	resp, err := warmClient.Do(req)
-	if err != nil {
-		return out, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		resp.Body.Close()
-		return out, fmt.Errorf("测速源 HTTP %d", resp.StatusCode)
-	}
-	found, routeOK, routeDesc := verifyProxyConnection(dctx, ep, host, node, int(warmPort.Load()))
-	out.RouteFound, out.RouteOK, out.Route = found, routeOK, routeDesc
-	if found && !routeOK {
-		resp.Body.Close()
-		return out, fmt.Errorf("测速流量没有经过当前节点：%s", routeDesc)
-	}
-	if warmBytes > 0 {
-		got, rerr := readAtMost(dctx, resp.Body, warmBytes)
-		resp.Body.Close()
-		if rerr != nil && dctx.Err() == nil {
-			return out, rerr
-		}
-		if got < 100000 {
-			return out, fmt.Errorf("预热下载数据过少")
-		}
-	} else {
-		resp.Body.Close()
-	}
-
-	// Open independent HTTP streams first, then release them together. This makes
-	// the timed section much less sensitive to connection-establishment latency.
-	// Stream requests use a cancellable context so the time limit interrupts a
-	// blocked Body.Read immediately rather than waiting on the remote server.
-	benchCtx, benchCancel := context.WithCancel(dctx)
-	defer benchCancel()
-	type openResult struct {
-		s   openedStream
-		err error
-	}
-	openCh := make(chan openResult, profile.Streams)
-	streamBytes := int64(profile.PerStreamMB) * 1000 * 1000
-	for i := 0; i < profile.Streams; i++ {
-		go func() {
-			client, tr, _ := newSpeedClient(proxyPort)
-			target := "https://" + host + "/__down?bytes=" + strconv.FormatInt(streamBytes, 10)
-			rq, e := http.NewRequestWithContext(benchCtx, http.MethodGet, target, nil)
-			if e != nil {
-				tr.CloseIdleConnections()
-				openCh <- openResult{err: e}
-				return
-			}
-			rq.Header.Set("User-Agent", "ClashBandwidthTest/"+appVersion)
-			rq.Header.Set("Cache-Control", "no-cache")
-			rp, e := client.Do(rq)
-			if e != nil {
-				tr.CloseIdleConnections()
-				openCh <- openResult{err: e}
-				return
-			}
-			if rp.StatusCode < 200 || rp.StatusCode >= 300 {
-				rp.Body.Close()
-				tr.CloseIdleConnections()
-				openCh <- openResult{err: fmt.Errorf("测速源 HTTP %d", rp.StatusCode)}
-				return
-			}
-			openCh <- openResult{s: openedStream{body: rp.Body, tr: tr}}
-		}()
-	}
-	streams := make([]openedStream, 0, profile.Streams)
-	var firstOpenErr error
-	for i := 0; i < profile.Streams; i++ {
-		r := <-openCh
-		if r.err != nil {
-			if firstOpenErr == nil {
-				firstOpenErr = r.err
-			}
-			continue
-		}
-		streams = append(streams, r.s)
-	}
-	if len(streams) == 0 {
-		if firstOpenErr != nil {
-			return out, firstOpenErr
-		}
-		return out, fmt.Errorf("无法建立测速连接")
-	}
-
-	var total int64
-	var readers sync.WaitGroup
-	readers.Add(len(streams))
-	for _, st := range streams {
-		st := st
-		go func() {
-			defer readers.Done()
-			defer st.body.Close()
-			defer st.tr.CloseIdleConnections()
-			buf := make([]byte, 128*1024)
-			for {
-				select {
-				case <-benchCtx.Done():
-					return
-				default:
-				}
-				n, er := st.body.Read(buf)
-				if n > 0 {
-					atomic.AddInt64(&total, int64(n))
-				}
-				if er != nil {
-					return
-				}
-			}
-		}()
-	}
-	allDone := make(chan struct{})
-	go func() { readers.Wait(); close(allDone) }()
-
-	start := time.Now()
-	lastAt := start
-	var lastBytes int64
-	var samples []float64
-	peak := 0.0
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	timer := time.NewTimer(profile.Duration)
-	defer timer.Stop()
-
-loop:
-	for {
-		select {
-		case now := <-ticker.C:
-			cur := atomic.LoadInt64(&total)
-			dt := now.Sub(lastAt).Seconds()
-			if dt > 0 {
-				rate := float64(cur-lastBytes) / 1000000.0 / dt
-				if rate >= 0 {
-					samples = append(samples, rate)
-					if rate > peak {
-						peak = rate
-					}
-				}
-			}
-			lastBytes, lastAt = cur, now
-		case <-allDone:
-			break loop
-		case <-timer.C:
-			benchCancel()
-			break loop
-		case <-ctx.Done():
-			benchCancel()
-			readers.Wait()
-			return out, ctx.Err()
-		}
-	}
-	benchCancel()
-	readers.Wait()
-	elapsed := time.Since(start).Seconds()
-	bytesDone := atomic.LoadInt64(&total)
-	if bytesDone < 100000 {
-		return out, fmt.Errorf("下载数据过少")
-	}
-	if elapsed <= 0 {
-		return out, fmt.Errorf("无效计时")
-	}
-	avg := float64(bytesDone) / 1000000.0 / elapsed
-	if peak <= 0 {
-		peak = avg
-	}
-	p90 := percentile90(samples)
-	if p90 <= 0 {
-		p90 = avg
-	}
-	out.Average, out.Peak, out.P90 = avg, peak, p90
-	return out, nil
+	return benchmarkDownload(ctx, node, proxyPort, profile, source, appVersion, newSpeedClient, verify)
 }
 
 type recoveryState struct {
@@ -2466,6 +2231,13 @@ func startSelectedRetest() {
 		return
 	}
 	profile := selectedProfile()
+	if profile.Source == "custom" {
+		if _, err := customDownloadSource(profile.CustomURL); err != nil {
+			setAdvancedVisible(true)
+			msgBox(appTitle, err.Error(), MB_OK|MB_ICONWARNING)
+			return
+		}
+	}
 
 	mu.Lock()
 	gp, ok := loadedProxies[group]
@@ -2503,6 +2275,7 @@ func startSelectedRetest() {
 		r.P90 = 0
 		r.Peak = 0
 		r.Route = ""
+		r.Error = ""
 		r.Status = "重测准备"
 	})
 	setRunStatus(runID, "正在重测："+row.Name)
@@ -2557,7 +2330,7 @@ func startSelectedRetest() {
 			return
 		}
 		if err := switchGroup(ctx, ep, group, node); err != nil {
-			updateRow(idx, func(r *resultRow) { r.Status = "切换失败" })
+			updateRow(idx, func(r *resultRow) { r.Status = "切换失败"; r.Error = err.Error() })
 			return
 		}
 		setLocalGroupNow(group, node)
@@ -2568,7 +2341,11 @@ func startSelectedRetest() {
 		case <-time.After(profile.Settle):
 		}
 		updateRow(idx, func(r *resultRow) { r.Status = "测速中" })
-		sr, err := measureSpeed(ctx, ep, node, proxyPort, profile)
+		p := newSourcePolicyWithCustom(profile.Source, profile.CustomURL)
+		sr, err := p.Try(func(src downloadSource) (speedResult, error) {
+			return measureSpeedWithSource(ctx, ep, node, proxyPort, profile, src)
+		})
+
 		if err != nil {
 			if ctx.Err() != nil {
 				outcome = 1
@@ -2576,6 +2353,7 @@ func startSelectedRetest() {
 			}
 			updateRow(idx, func(r *resultRow) {
 				r.Route = sr.Route
+				r.Error = err.Error()
 				if sr.RouteFound && !sr.RouteOK {
 					r.Status = "分流异常"
 				} else {
@@ -2589,7 +2367,17 @@ func startSelectedRetest() {
 			r.P90 = sr.P90
 			r.Peak = sr.Peak
 			r.Route = sr.Route
-			r.Status = "完成"
+			r.Error = "测速源：" + sr.Source + func() string {
+				if sr.Warning != "" {
+					return "；" + sr.Warning
+				}
+				return ""
+			}()
+			if sr.Warning != "" {
+				r.Status = "部分完成"
+			} else {
+				r.Status = "完成"
+			}
 		})
 		setRunStatus(runID, fmt.Sprintf("重测完成：%s · 平均 %.2f MB/s", node, sr.Average))
 	}(row.Name, rowIdx)
@@ -2618,6 +2406,13 @@ func startTest() {
 		return
 	}
 	profile := selectedProfile()
+	if profile.Source == "custom" {
+		if _, err := customDownloadSource(profile.CustomURL); err != nil {
+			setAdvancedVisible(true)
+			msgBox(appTitle, err.Error(), MB_OK|MB_ICONWARNING)
+			return
+		}
+	}
 	scope := selectedScope()
 	perRegion := selectedPerRegion()
 
@@ -2648,7 +2443,11 @@ func startTest() {
 	}
 
 	scopeDesc := scopeDescriptionForRun(nodes, perRegion)
-	warning := fmt.Sprintf("即将开始测速。\r\n\r\n范围：%s\r\n策略组：%s\r\n测速前节点：%s\r\n\r\n第一阶段的延迟扫描不会切换策略组；第二阶段带宽测速会临时切换该策略组中的节点，因此正在使用同一策略组的程序可能短暂断线。\r\n\r\n本工具不会修改 Windows 系统代理、TUN、DNS、路由表或网卡设置；测速结束/停止/正常关闭时会恢复原节点。\r\n\r\n继续吗？", scopeDesc, group, original)
+	wf := "每个节点依次测延迟，然后立即切换测速并保存结果。"
+	if needsLatencyPrescan(scope, perRegion) {
+		wf = "先扫描延迟选出候选，再进行带宽测速。"
+	}
+	warning := fmt.Sprintf("即将开始测速。\r\n\r\n范围：%s\r\n策略组：%s\r\n测速前节点：%s\r\n\r\n%s\r\n下载测速将临时切换当前策略组的节点，可能导致正在使用该策略组的程序短暂断线。\r\n\r\n不修改 Windows 系统代理、TUN、DNS、路由表或网卡设置；测速结束/停止/正常关闭时恢复原节点。\r\n\r\n继续吗？", scopeDesc, group, original, wf)
 	if msgBoxResult(appTitle, warning, MB_YESNO|MB_ICONWARNING) != IDYES {
 		return
 	}
@@ -2675,7 +2474,7 @@ func startTest() {
 	mu.Unlock()
 	refreshList()
 	setRunning(true)
-	setRunStatus(runID, fmt.Sprintf("第一阶段：准备延迟扫描 0/%d；这一阶段不会切换当前策略组。", len(nodes)))
+	setRunStatus(runID, fmt.Sprintf("准备测速 %d 个节点；仅需抽样时先做延迟扫描。", len(nodes)))
 
 	go func() {
 		outcome := uintptr(0) // 0=完成, 1=停止, 2=错误
@@ -2724,76 +2523,80 @@ func startTest() {
 			return
 		}
 
-		// Stage 1: latency-only scan. This calls Mihomo's per-node delay API and does
-		// not switch the user's selected strategy group.
-		latencies := make(map[string]int, len(nodes))
-		stage1Start := time.Now()
-		for i, node := range nodes {
-			select {
-			case <-ctx.Done():
-				outcome = 1
-				return
-			default:
-			}
-			idx := rowIndexByName(node)
-			if idx >= 0 {
-				updateRow(idx, func(r *resultRow) { r.Status = "延迟扫描" })
-			}
-			latency := measureLatency(ctx, ep, node)
-			latencies[node] = latency
-			if idx >= 0 {
-				updateRow(idx, func(r *resultRow) {
-					r.Latency = latency
-					if latency > 0 {
-						r.Status = "延迟完成"
-					} else {
-						r.Status = "延迟失败"
-					}
-				})
-			}
-			done := i + 1
-			elapsed := time.Since(stage1Start)
-			remaining := ""
-			if done > 0 && done < len(nodes) {
-				eta := time.Duration(float64(elapsed) / float64(done) * float64(len(nodes)-done))
-				remaining = fmt.Sprintf(" · 预计剩余 %s", shortDuration(eta))
-			}
-			setRunStatus(runID, fmt.Sprintf("第一阶段：延迟扫描 %d/%d · %s%s", done, len(nodes), node, remaining))
-		}
-
+		// Only selections requiring ranking/shortlisting need a separate
+		// latency-only pass. When every selected node will be benchmarked,
+		// do its latency and download consecutively, one node at a time.
+		preScan := needsLatencyPrescan(scope, perRegion)
 		var candidates []string
-		if scope == scopeSmart || (scope == scopeRegions && perRegion > 0) {
+		if preScan {
+			latencies := make(map[string]int, len(nodes))
+			stage1Start := time.Now()
+			for i, node := range nodes {
+				if ctx.Err() != nil {
+					outcome = 1
+					return
+				}
+				idx := rowIndexByName(node)
+				if idx >= 0 {
+					updateRow(idx, func(r *resultRow) { r.Status = "延迟扫描" })
+				}
+				latency := measureLatency(ctx, ep, node)
+				latencies[node] = latency
+				if idx >= 0 {
+					updateRow(idx, func(r *resultRow) {
+						r.Latency = latency
+						if latency > 0 {
+							r.Status = "延迟完成"
+						} else {
+							r.Status = "延迟失败"
+						}
+					})
+				}
+				done := i + 1
+				remaining := ""
+				if done < len(nodes) {
+					remaining = fmt.Sprintf(" · 预计剩余 %s", shortDuration(time.Duration(float64(time.Since(stage1Start))/float64(done)*float64(len(nodes)-done))))
+				}
+				setRunStatus(runID, fmt.Sprintf("第一阶段：延迟扫描 %d/%d · %s%s", done, len(nodes), node, remaining))
+			}
 			candidates = selectRegionalCandidates(nodes, latencies, perRegion)
+			selected := make(map[string]bool, len(candidates))
+			for _, n := range candidates {
+				selected[n] = true
+			}
+			for _, n := range nodes {
+				idx := rowIndexByName(n)
+				if idx < 0 {
+					continue
+				}
+				if selected[n] {
+					updateRow(idx, func(r *resultRow) { r.Status = "候选" })
+				} else {
+					updateRow(idx, func(r *resultRow) { r.Status = "仅延迟" })
+				}
+			}
 		} else {
 			candidates = append([]string(nil), nodes...)
-		}
-		candidateSet := map[string]bool{}
-		for _, n := range candidates {
-			candidateSet[n] = true
-		}
-		for _, n := range nodes {
-			idx := rowIndexByName(n)
-			if idx < 0 {
-				continue
-			}
-			if candidateSet[n] {
-				updateRow(idx, func(r *resultRow) { r.Status = "候选" })
-			} else {
-				updateRow(idx, func(r *resultRow) { r.Status = "仅延迟" })
+			for _, n := range candidates {
+				idx := rowIndexByName(n)
+				if idx >= 0 {
+					updateRow(idx, func(r *resultRow) { r.Status = "等待测速" })
+				}
 			}
 		}
 		if len(candidates) == 0 {
 			mu.Lock()
-			lastError = "延迟筛选后没有可测速候选节点"
+			lastError = "没有可测速候选节点"
 			mu.Unlock()
 			outcome = 2
 			return
 		}
 
 		stage2Start := time.Now()
+		sources := newSourcePolicyWithCustom(profile.Source, profile.CustomURL)
 		mismatchCount := 0
 		mismatchRoute := ""
-		setRunStatus(runID, fmt.Sprintf("第二阶段：开始带宽测速 0/%d；将临时切换“%s”，结束后恢复“%s”。", len(candidates), group, original))
+		setRunStatus(runID, fmt.Sprintf("开始逐节点测速 0/%d；结束后恢复“%s”。", len(candidates), original))
 		for i, node := range candidates {
 			select {
 			case <-ctx.Done():
@@ -2805,9 +2608,19 @@ func startTest() {
 			if idx < 0 {
 				continue
 			}
-			updateRow(idx, func(r *resultRow) { r.Status = "切换中" })
+			if !preScan {
+				updateRow(idx, func(r *resultRow) { r.Status = "延迟扫描" })
+				latency := measureLatency(ctx, ep, node)
+				if ctx.Err() != nil {
+					outcome = 1
+					return
+				}
+				updateRow(idx, func(r *resultRow) { r.Latency = latency; r.Status = "切换中" })
+			} else {
+				updateRow(idx, func(r *resultRow) { r.Status = "切换中" })
+			}
 			if err := switchGroup(ctx, ep, group, node); err != nil {
-				updateRow(idx, func(r *resultRow) { r.Status = "切换失败" })
+				updateRow(idx, func(r *resultRow) { r.Status = "切换失败"; r.Error = err.Error() })
 				continue
 			}
 			select {
@@ -2817,7 +2630,14 @@ func startTest() {
 			case <-time.After(profile.Settle):
 			}
 			updateRow(idx, func(r *resultRow) { r.Status = "测速中" })
-			sr, err := measureSpeed(ctx, ep, node, proxyPort, profile)
+			prevSource := sources.Selected
+			sr, err := sources.Try(func(src downloadSource) (speedResult, error) {
+				return measureSpeedWithSource(ctx, ep, node, proxyPort, profile, src)
+			})
+			if prevSource != sources.Selected && err == nil {
+				setRunStatus(runID, fmt.Sprintf("测速源已锁定为 %s；本轮所有节点使用同一测速源。", sr.Source))
+			}
+
 			if err != nil {
 				if ctx.Err() != nil {
 					outcome = 1
@@ -2825,12 +2645,26 @@ func startTest() {
 				}
 				updateRow(idx, func(r *resultRow) {
 					r.Route = sr.Route
+					r.Error = err.Error()
 					if sr.RouteFound && !sr.RouteOK {
 						r.Status = "分流异常"
 					} else {
 						r.Status = "测速失败"
 					}
 				})
+				if isRateLimited(err) {
+					updateRow(idx, func(r *resultRow) { r.Status = "测速源限流" })
+					for _, pending := range candidates[i+1:] {
+						if nidx := rowIndexByName(pending); nidx >= 0 {
+							updateRow(nidx, func(r *resultRow) { r.Status = "未测（测速源限流）" })
+						}
+					}
+					mu.Lock()
+					lastError = "测速服务器返回 HTTP 429（请求过于频繁）。为保护测速源和避免误判节点，已停止本轮下载测速。请稍后选择其他服务器重新开始完整一轮。"
+					mu.Unlock()
+					outcome = 2
+					break
+				}
 				if sr.RouteFound && !sr.RouteOK {
 					if sr.Route == mismatchRoute {
 						mismatchCount++
@@ -2854,7 +2688,17 @@ func startTest() {
 					r.P90 = sr.P90
 					r.Peak = sr.Peak
 					r.Route = sr.Route
-					r.Status = "完成"
+					r.Error = "测速源：" + sr.Source + func() string {
+						if sr.Warning != "" {
+							return "；" + sr.Warning
+						}
+						return ""
+					}()
+					if sr.Warning != "" {
+						r.Status = "部分完成"
+					} else {
+						r.Status = "完成"
+					}
 				})
 			}
 
@@ -2866,6 +2710,15 @@ func startTest() {
 				remaining = fmt.Sprintf(" · 预计剩余 %s", shortDuration(eta))
 			}
 			setRunStatus(runID, fmt.Sprintf("第二阶段：已完成 %d/%d · %s%s", done, len(candidates), node, remaining))
+			// Public origins are shared infrastructure: never hammer them with back-to-back downloads.
+			if done < len(candidates) {
+				select {
+				case <-ctx.Done():
+					outcome = 1
+					return
+				case <-time.After(2500 * time.Millisecond):
+				}
+			}
 		}
 
 		mu.Lock()
@@ -3219,8 +3072,12 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 				updateRegionButton()
 				updateEstimate()
 			}
-		case IDC_SIZE, IDC_PERREGION:
+		case IDC_SIZE, IDC_PERREGION, IDC_SOURCE:
 			if notify == CBN_SELCHANGE {
+				if id == IDC_SOURCE && int(send(hSource, CB_GETCURSEL, 0, 0)) == 6 {
+					setAdvancedVisible(true)
+					setText(hStatus, "自定义测速：请在下方填入 HTTPS 大文件下载 URL（不要填写含密码或 Token 的链接）。")
+				}
 				updateEstimate()
 			}
 		case IDC_SCOPE:
@@ -3289,7 +3146,13 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		mu.Unlock()
 		if errText != "" {
 			setText(hDetected, "○ 未自动连接 Clash Verge Rev")
-			setText(hStatus, "自动检测失败。已展开高级设置，可手动填写 Controller / Secret，或点击“重新检测”。")
+			if remembered, e := loadRememberedEndpoint(); e == nil {
+				setText(hController, remembered.Base)
+				setText(hSecret, remembered.Secret)
+				setText(hStatus, "自动连接失败，但已填入本机加密保存的 Controller / Secret；无需重新输入，可点击“手动连接”。原因："+errText)
+			} else {
+				setText(hStatus, "自动检测失败。请检查 Clash Verge Rev 是否运行；若需手动连接，填写 Controller / Secret。原因："+errText)
+			}
 			setAdvancedVisible(true)
 			return 0
 		}
@@ -3313,6 +3176,12 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		status := fmt.Sprintf("自动检测完成：发现 %d 个 Selector 策略组。", n)
 		if cfgPath != "" {
 			status += " 已读取本机运行配置。"
+		}
+		mu.Lock()
+		saveErr := connectionSaveErr
+		mu.Unlock()
+		if saveErr != "" {
+			status += " 连接已成功，但本机加密保存失败：" + saveErr
 		}
 		setText(hStatus, status)
 		setAdvancedVisible(false)
@@ -3373,6 +3242,16 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		}
 		errText := lastError
 		wasSingle := singleRetest
+		successCount, failureCount := 0, 0
+		for _, row := range rows {
+			if row.Status == "完成" || row.Status == "部分完成" {
+				successCount++
+			}
+			switch row.Status {
+			case "测速失败", "分流异常", "切换失败":
+				failureCount++
+			}
+		}
 		singleRetest = false
 		shouldClose := closePending
 		closePending = false
@@ -3386,17 +3265,17 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		}
 		switch lParam {
 		case 1:
-			setText(hStatus, "测速已停止，并已尝试恢复测速前节点。")
+			setText(hStatus, fmt.Sprintf("测速已停止，并已尝试恢复测速前节点。已完成 %d 个，失败 %d 个；未完成项目已标记。失败原因见最右侧“错误详情”列。", successCount, failureCount))
 		case 2:
-			setText(hStatus, "测速结束，但出现错误；原节点已尝试恢复。")
+			setText(hStatus, fmt.Sprintf("测速结束，但出现错误；原节点已尝试恢复。已完成 %d 个，失败 %d 个。", successCount, failureCount))
 			if errText != "" {
 				msgBox(appTitle, errText, MB_OK|MB_ICONERROR)
 			}
 		default:
 			if wasSingle {
-				setText(hStatus, "选中节点重测完成，并已恢复重测前节点。")
+				setText(hStatus, "选中节点重测结束，并已恢复重测前节点；如失败，请查看该行最右侧错误详情。")
 			} else {
-				setText(hStatus, "测速完成：结果已整理，并已恢复测速前节点。")
+				setText(hStatus, fmt.Sprintf("测速完成：成功 %d 个，失败 %d 个；已恢复测速前节点。失败原因见最右侧“错误详情”列。", successCount, failureCount))
 			}
 		}
 		return 0
@@ -3534,10 +3413,17 @@ func main() {
 	hNameFilter = createControl(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP, 88, 90, 262, 25, IDC_FILTER)
 	createControl(0, "STATIC", "测速模式", WS_CHILD|WS_VISIBLE, 370, 94, 68, 22, 0)
 	hSize = createControl(WS_EX_CLIENTEDGE, "COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST, 440, 90, 282, 120, IDC_SIZE)
-	for _, text := range []string{"快速筛选 · 2秒 / 2路 / ≤13MB", "标准测速 · 5秒 / 4路 / ≤62MB"} {
+	for _, text := range []string{"快速筛选 · 2秒 / 1路 / ≤6MB", "标准测速 · 5秒 / 2路 / ≤30MB"} {
 		send(hSize, CB_ADDSTRING, 0, uintptr(unsafe.Pointer(u16(text))))
 	}
 	send(hSize, CB_SETCURSEL, 0, 0)
+	createControl(0, "STATIC", "测速源", WS_CHILD|WS_VISIBLE, 736, 94, 60, 22, 0)
+	hSource = createControl(WS_EX_CLIENTEDGE, "COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST, 790, 90, 226, 120, IDC_SOURCE)
+	for _, label := range []string{"自动（Google优先）", "Google Chrome 文件", "Google Chrome Windows", "Hetzner 德国", "OVH 新加坡", "Cloudflare（易限流）", "自定义 HTTPS 文件"} {
+		send(hSource, CB_ADDSTRING, 0, uintptr(unsafe.Pointer(u16(label))))
+	}
+	send(hSource, CB_SETCURSEL, 0, 0)
+
 	hEstimate = createControl(0, "STATIC", "等待读取节点数量 ...", WS_CHILD|WS_VISIBLE, 18, 124, 1008, 22, IDC_ESTIMATE)
 
 	hList = createControl(WS_EX_CLIENTEDGE, "SysListView32", "", WS_CHILD|WS_VISIBLE|LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS, 18, 150, 1008, 405, IDC_LIST)
@@ -3552,8 +3438,9 @@ func main() {
 	addColumn(5, "平均速度", 92)
 	addColumn(6, "稳态 P90", 88)
 	addColumn(7, "峰值速度", 88)
-	addColumn(8, "路径验证", 145)
-	addColumn(9, "状态", 88)
+	addColumn(8, "路径验证", 105)
+	addColumn(9, "状态", 78)
+	addColumn(10, "错误详情", 180)
 	resizeListColumns()
 
 	// Advanced/manual fallback. Hidden unless auto-detection fails or the user opens it.
@@ -3565,8 +3452,12 @@ func main() {
 	hConnect = createControl(0, "BUTTON", "手动连接", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 565, 576, 92, 27, IDC_CONNECT)
 	hRedetect = createControl(0, "BUTTON", "重新检测", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 668, 576, 92, 27, IDC_REDETECT)
 	hRemember = createControl(0, "BUTTON", "记住连接（本机加密）", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 774, 577, 238, 27, IDC_REMEMBER)
-	if _, err := loadRememberedEndpoint(); err == nil {
+	hCustomLabel = createControl(0, "STATIC", "测速文件 URL", WS_CHILD|WS_VISIBLE, 18, 615, 100, 22, 0)
+	hCustomURL = createControl(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP, 118, 612, 895, 25, IDC_CUSTOM_URL)
+	if remembered, err := loadRememberedEndpoint(); err == nil {
 		send(hRemember, BM_SETCHECK, BST_CHECKED, 0)
+		setText(hController, remembered.Base)
+		setText(hSecret, remembered.Secret)
 	}
 
 	hStatus = createControl(0, "STATIC", "v"+appVersion+"：支持系统托盘、全局快捷键、单实例运行。双击节点可直接切换；选中一行可“重测选中”。", WS_CHILD|WS_VISIBLE, 18, 650, 1008, 42, IDC_STATUS)

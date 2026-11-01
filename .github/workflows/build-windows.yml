@@ -19,6 +19,9 @@ jobs:
           go-version-file: go.mod
           cache: false
 
+      - name: Unit tests
+        run: go test ./...
+
       - name: Vet
         run: GOOS=windows GOARCH=amd64 go vet ./...
 
